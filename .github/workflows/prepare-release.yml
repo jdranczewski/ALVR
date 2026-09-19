@@ -79,10 +79,7 @@ jobs:
     needs:
       [
         prepare_release,
-        build_windows_streamer,
         build_linux_streamer,
-        build_flatpak_bundle,
-        build_android_client,
       ]
     steps:
       - name: Download artifacts
