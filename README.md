@@ -1,6 +1,6 @@
 <p align="center"> <img width="500" src="resources/ALVR-Grey.svg"/> </p>
 
-# ALVR - Air Light VR
+# ALVR - Air Light VRR
 
 [![badge-discord][]][link-discord] [![badge-matrix][]][link-matrix] [![badge-opencollective][]][link-opencollective]
 
