@@ -8,39 +8,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      - uses: crazy-max/ghaction-chocolatey@v4
-        with:
-          args: install zip unzip pkgconfiglite
-
-      - name: Prepare deps
-        env:
-          RUST_BACKTRACE: 1
-        run: cargo xtask prepare-deps --platform windows
-
-      - name: Build and package ALVR (.zip)
-        env:
-          RUST_BACKTRACE: 1
-        run: |
-          mkdir artifacts/
-          cargo xtask build-streamer --platform windows --ci
-          zip -r9X artifacts/alvr_streamer_windows.zip ./build/alvr_streamer*
-          cargo xtask build-launcher --platform windows --ci
-          zip -r9X artifacts/alvr_launcher_windows.zip ./build/alvr_launcher*
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: Windows packages
-          path: ./artifacts/*
-
-
+  
   build-linux:
     runs-on: ubuntu-24.04
     steps:
