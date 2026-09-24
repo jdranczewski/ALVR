@@ -6,7 +6,7 @@ use crate::{
     logging_backend, tracking::HandType,
 };
 use alvr_common::{
-    AlvrCodecType, AlvrPose, AlvrViewParams, log,
+    AlvrCodecType, AlvrFoveatedEncodingParams, AlvrPose, AlvrQuat, AlvrViewParams, log,
     parking_lot::{Mutex, RwLock},
 };
 use alvr_packets::{ButtonEntry, ButtonValue, Haptics};
@@ -102,6 +102,7 @@ pub struct AlvrNegotiatedConfig {
     pub target_view_resolution: [u32; 2],
     pub refresh_rate: f32,
     pub enable_foveated_encoding: bool,
+    pub foveated_encoding: AlvrFoveatedEncodingParams,
     pub codec: AlvrCodecType,
     pub h264_profile: u32,
     pub use_10bit_encoder: bool,
@@ -383,6 +384,27 @@ pub unsafe extern "C" fn alvr_get_hand_skeleton(
     }
 }
 
+/// Return head-local gaze for an exact retained tracking timestamp, with -Z along the gaze.
+/// Returns false without writing out_gaze if the sample has no gaze or is no longer retained.
+///
+/// # Safety
+/// out_gaze must point to a valid, writable AlvrQuat.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn alvr_get_combined_eye_gaze(
+    sample_timestamp_ns: u64,
+    out_gaze: *mut AlvrQuat,
+) -> bool {
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read()
+        && let Some(gaze) = context.get_combined_eye_gaze(Duration::from_nanos(sample_timestamp_ns))
+    {
+        unsafe { *out_gaze = alvr_common::to_capi_quat(&gaze) };
+
+        true
+    } else {
+        false
+    }
+}
+
 /// Call with null out_entries to get the buffer length
 /// call with non-null out_entries to get the buttons and advanced the internal queue
 #[unsafe(no_mangle)]
@@ -423,7 +445,8 @@ pub unsafe extern "C" fn alvr_get_negotiated_config(out_config: *mut AlvrNegotia
                     config.emulated_headset_view_resolution.y,
                 ],
                 refresh_rate: config.refresh_rate,
-                enable_foveated_encoding: config.enable_foveated_encoding,
+                enable_foveated_encoding: config.foveated_encoding.is_some(),
+                foveated_encoding: config.foveated_encoding.unwrap_or_default(),
                 codec: match config.codec {
                     CodecType::H264 => AlvrCodecType::H264,
                     CodecType::Hevc => AlvrCodecType::Hevc,
@@ -482,10 +505,17 @@ pub unsafe extern "C" fn alvr_set_video_config_nals(
 }
 
 /// global_view_params must be an array of length 2
+/// `foveation_center_shifts` must contain the centers used to encode this frame, already aligned.
+/// Frames with the same timestamp_ns must use the same centers.
+/// Pass null when FFR is disabled or no new center information is available.
+/// Safety: `foveation_center_shifts` must be null or point to an initialized
+/// `float[2][2]` array, in left/right eye and X/Y order, that remains valid for this call.
+/// The centers are copied; the pointer is not retained.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alvr_send_video_nal(
     timestamp_ns: u64,
     global_view_params: *const AlvrViewParams,
+    foveation_center_shifts: *const [[f32; 2]; 2],
     is_idr: bool,
     buffer_ptr: *mut u8,
     len: i32,
@@ -503,6 +533,8 @@ pub unsafe extern "C" fn alvr_send_video_nal(
         context.send_video_nal(
             Duration::from_nanos(timestamp_ns),
             global_view_params,
+            // # Safety: the caller provides either null or a valid 2x2 centers array.
+            unsafe { foveation_center_shifts.as_ref() }.copied(),
             is_idr,
             buffer.to_vec(),
         );

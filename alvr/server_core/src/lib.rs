@@ -11,14 +11,15 @@ mod tracking;
 mod web_server;
 
 pub use c_api::*;
+pub use connection::align_foveation_center_shift;
 pub use logging_backend::init_logging;
 pub use tracking::HandType;
 
 use crate::connection::VideoPacket;
 use alvr_common::{
-    ConnectionState, DEVICE_ID_TO_PATH, DeviceMotion, LifecycleState, Pose, ViewParams,
-    dbg_server_core, error,
-    glam::{UVec2, Vec2},
+    AlvrFoveatedEncodingParams, ConnectionState, DEVICE_ID_TO_PATH, DeviceMotion, LifecycleState,
+    Pose, ViewParams, dbg_server_core, error,
+    glam::{Quat, UVec2, Vec2},
     parking_lot::{Mutex, RwLock},
     settings_schema::Switch,
     warn,
@@ -74,7 +75,7 @@ pub struct ServerNegotiatedStreamingConfig {
     pub transcoding_view_resolution: UVec2,
     pub emulated_headset_view_resolution: UVec2,
     pub refresh_rate: f32,
-    pub enable_foveated_encoding: bool,
+    pub foveated_encoding: Option<AlvrFoveatedEncodingParams>,
     pub codec: CodecType,
     pub h264_profile: H264Profile,
     pub use_10bit_encoder: bool,
@@ -293,6 +294,17 @@ impl ServerCoreContext {
             .copied()
     }
 
+    /// Return head-local gaze for an exact retained tracking timestamp, with -Z along the gaze.
+    /// Returns None if the sample has no gaze or is no longer in the bounded history.
+    pub fn get_combined_eye_gaze(&self, sample_timestamp: Duration) -> Option<Quat> {
+        dbg_server_core!("get_combined_eye_gaze: sample_ts={sample_timestamp:?}");
+
+        self.connection_context
+            .tracking_manager
+            .read()
+            .get_combined_eye_gaze(sample_timestamp)
+    }
+
     pub fn get_motion_to_photon_latency(&self) -> Duration {
         dbg_server_core!("get_motion_to_photon_latency");
 
@@ -385,6 +397,7 @@ impl ServerCoreContext {
         &self,
         timestamp: Duration,
         global_view_params: [ViewParams; 2],
+        foveation_center_shifts: Option<[[f32; 2]; 2]>,
         is_idr: bool,
         nal_buffer: Vec<u8>,
     ) {
@@ -444,6 +457,7 @@ impl ServerCoreContext {
                     header: VideoPacketHeader {
                         timestamp,
                         global_view_params,
+                        foveation_center_shifts,
                         is_idr,
                     },
                     payload: nal_buffer,
@@ -591,9 +605,6 @@ impl Drop for ServerCoreContext {
             thread::sleep(Duration::from_millis(100));
         }
 
-        // Dropping the webserver runtime is bugged on linux and will prevent StemVR shutdown
-        if !cfg!(target_os = "linux") {
-            self.webserver_runtime.take();
-        }
+        self.webserver_runtime.take();
     }
 }

@@ -1,3 +1,4 @@
+mod foveated_encoding;
 mod graphics;
 mod props;
 mod tracking;
@@ -27,8 +28,9 @@ use alvr_server_core::{
     HandType, ServerCoreContext, ServerCoreEvent, ServerNegotiatedStreamingConfig,
 };
 use alvr_session::{
-    BodyTrackingSinkConfig, CodecType, ControllersConfig, ControllersEmulationMode,
+    BodyTrackingSinkConfig, CodecType, ControllersConfig, ControllersEmulationMode, GazeInputSource,
 };
+use foveated_encoding::EyeTrackedFoveation;
 use std::{
     collections::VecDeque,
     ffi::{CString, OsStr, c_char, c_void},
@@ -38,9 +40,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+const FOVEATION_CENTER_HISTORY_CAPACITY: usize = 360;
+
 static SERVER_CORE_CONTEXT: RwLock<Option<ServerCoreContext>> = RwLock::new(None);
 static LOCAL_VIEW_PARAMS: RwLock<[ViewParams; 2]> = RwLock::new([ViewParams::DUMMY; 2]);
 static HEAD_POSE_QUEUE: Mutex<VecDeque<(Duration, Pose)>> = Mutex::new(VecDeque::new());
+static FOVEATION_CENTER_QUEUE: Mutex<VecDeque<(Duration, [[f32; 2]; 2])>> =
+    Mutex::new(VecDeque::new());
+static EYE_TRACKED_FOVEATION: Mutex<Option<EyeTrackedFoveation>> = Mutex::new(None);
 static EVENT_LOOP_HANDLE: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
 static IDLE_INIT_HANDLE: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
 static FACTORY_INIT_DATA: Mutex<Option<FactoryInitData>> = Mutex::new(None);
@@ -98,25 +105,8 @@ fn make_settings(negotiated: Option<&ServerNegotiatedStreamingConfig>) -> Settin
         .map(|c| c.sources.meta.prefer_full_body)
         .unwrap_or(false);
 
-    let (
-        fov_center_size_x,
-        fov_center_size_y,
-        fov_center_shift_x,
-        fov_center_shift_y,
-        fov_edge_ratio_x,
-        fov_edge_ratio_y,
-    ) = if let Switch::Enabled(config) = &video.foveated_encoding {
-        (
-            config.center_size_x,
-            config.center_size_y,
-            config.center_shift_x,
-            config.center_shift_y,
-            config.edge_ratio_x,
-            config.edge_ratio_y,
-        )
-    } else {
-        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-    };
+    let foveated_encoding = negotiated.and_then(|n| n.foveated_encoding);
+    let foveation_params = foveated_encoding.unwrap_or_default();
 
     let (enable_color_correction, brightness, contrast, saturation, gamma, sharpening) =
         if let Switch::Enabled(config) = &video.color_correction {
@@ -154,25 +144,18 @@ fn make_settings(negotiated: Option<&ServerNegotiatedStreamingConfig>) -> Settin
         };
 
     // Encoder params determined by negotiation; default to zero before any client connects.
-    let (
-        enable_foveated_encoding,
-        codec,
-        h264_profile,
-        use_10bit_encoder,
-        encoding_gamma,
-        enable_hdr,
-    ) = if let Some(n) = negotiated {
-        (
-            n.enable_foveated_encoding,
-            n.codec as i32,
-            n.h264_profile as i32,
-            n.use_10bit_encoder,
-            n.encoding_gamma as f64,
-            n.enable_hdr,
-        )
-    } else {
-        (false, 0, 0, false, 0.0, false)
-    };
+    let (codec, h264_profile, use_10bit_encoder, encoding_gamma, enable_hdr) =
+        if let Some(n) = negotiated {
+            (
+                n.codec as i32,
+                n.h264_profile as i32,
+                n.use_10bit_encoder,
+                n.encoding_gamma as f64,
+                n.enable_hdr,
+            )
+        } else {
+            (0, 0, false, 0.0, false)
+        };
 
     Settings {
         m_refreshRate: refresh_rate,
@@ -182,13 +165,14 @@ fn make_settings(negotiated: Option<&ServerNegotiatedStreamingConfig>) -> Settin
         m_recommendedTargetHeight: target_height as i32,
         m_nAdapterIndex: video.adapter_index as i32,
         m_captureFrameDir: capture_frame_dir,
-        m_enableFoveatedEncoding: enable_foveated_encoding,
-        m_foveationCenterSizeX: fov_center_size_x,
-        m_foveationCenterSizeY: fov_center_size_y,
-        m_foveationCenterShiftX: fov_center_shift_x,
-        m_foveationCenterShiftY: fov_center_shift_y,
-        m_foveationEdgeRatioX: fov_edge_ratio_x,
-        m_foveationEdgeRatioY: fov_edge_ratio_y,
+        m_enableFoveatedEncoding: foveated_encoding.is_some(),
+        m_foveatedEncoding: FfiFoveatedEncodingParams {
+            encodedViewResolution: foveation_params.encoded_view_resolution,
+            viewRatio: foveation_params.view_ratio,
+            centerSize: foveation_params.center_size,
+            centerShifts: foveation_params.center_shifts,
+            edgeRatio: foveation_params.edge_ratio,
+        },
         m_enableColorCorrection: enable_color_correction,
         m_brightness: brightness,
         m_contrast: contrast,
@@ -265,6 +249,21 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                     props::set_openvr_prop(None, device_id, prop)
                 }
                 ServerCoreEvent::ClientConnected(config) => unsafe {
+                    FOVEATION_CENTER_QUEUE.lock().clear();
+                    *EYE_TRACKED_FOVEATION.lock() = config
+                        .foveated_encoding
+                        .filter(|_| {
+                            alvr_server_core::settings()
+                                .video
+                                .foveated_encoding
+                                .as_option()
+                                .is_some_and(|config| {
+                                    config.gaze_input_source == GazeInputSource::Headset
+                                })
+                        })
+                        .map(|params| {
+                            EyeTrackedFoveation::new(params, config.transcoding_view_resolution)
+                        });
                     if InitializeStreaming(make_settings(Some(&config))) {
                         RequestDriverResync();
                     } else {
@@ -274,7 +273,11 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                     }
                 },
 
-                ServerCoreEvent::ClientDisconnected => unsafe { DeinitializeStreaming() },
+                ServerCoreEvent::ClientDisconnected => unsafe {
+                    DeinitializeStreaming();
+                    *EYE_TRACKED_FOVEATION.lock() = None;
+                    FOVEATION_CENTER_QUEUE.lock().clear();
+                },
                 ServerCoreEvent::Battery(info) => unsafe {
                     SetBattery(info.device_id, info.gauge_value, info.is_plugged)
                 },
@@ -283,6 +286,9 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                 },
                 ServerCoreEvent::LocalViewParams(params) => unsafe {
                     *LOCAL_VIEW_PARAMS.write() = params;
+                    if let Some(foveation) = &mut *EYE_TRACKED_FOVEATION.lock() {
+                        foveation.view_params = Some(params);
+                    }
 
                     let ffi_params = [
                         tracking::to_ffi_view_params(params[0]),
@@ -303,6 +309,14 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                         .is_some_and(|c| c.detached_controllers_steamvr_sink);
 
                     if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+                        if let Some(foveation) = &mut *EYE_TRACKED_FOVEATION.lock() {
+                            foveation.update(
+                                poll_timestamp,
+                                context.get_combined_eye_gaze(poll_timestamp),
+                                Instant::now(),
+                            );
+                        }
+
                         let target_timestamp =
                             poll_timestamp + context.get_motion_to_photon_latency();
                         let controllers_pose_time_offset = context.get_tracker_pose_time_offset();
@@ -582,6 +596,37 @@ extern "C" fn set_video_config_nals(buffer_ptr: *const u8, len: i32, codec: i32)
     }
 }
 
+#[unsafe(export_name = "GetEyeTrackedFoveationCenters")]
+extern "C" fn get_eye_tracked_foveation_centers(timestamp_ns: u64) -> FfiFoveationCenters {
+    let centers = EYE_TRACKED_FOVEATION
+        .lock()
+        .as_ref()
+        .and_then(|foveation| foveation.centers(Duration::from_nanos(timestamp_ns)));
+
+    FfiFoveationCenters {
+        valid: centers.is_some(),
+        centerShifts: centers.unwrap_or_default(),
+    }
+}
+
+#[unsafe(export_name = "ReportEncoderFoveationCenters")]
+extern "C" fn report_encoder_foveation_centers(
+    timestamp_ns: u64,
+    left_x: f32,
+    left_y: f32,
+    right_x: f32,
+    right_y: f32,
+) {
+    let queue_mut = &mut *FOVEATION_CENTER_QUEUE.lock();
+    queue_mut.push_back((
+        Duration::from_nanos(timestamp_ns),
+        [[left_x, left_y], [right_x, right_y]],
+    ));
+    while queue_mut.len() > FOVEATION_CENTER_HISTORY_CAPACITY {
+        queue_mut.pop_front();
+    }
+}
+
 #[unsafe(export_name = "VideoSend")]
 extern "C" fn send_video(timestamp_ns: u64, buffer_ptr: *mut u8, len: i32, is_idr: bool) {
     if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
@@ -610,7 +655,23 @@ extern "C" fn send_video(timestamp_ns: u64, buffer_ptr: *mut u8, len: i32, is_id
             },
         ];
 
-        context.send_video_nal(timestamp, global_view_params, is_idr, buffer.to_vec());
+        // Keep entries until eviction: an encoder may output multiple NALs for one frame.
+        let foveation_center_shifts =
+            FOVEATION_CENTER_QUEUE
+                .lock()
+                .iter()
+                .rev()
+                .find_map(|(frame_timestamp, centers)| {
+                    (*frame_timestamp == timestamp).then_some(*centers)
+                });
+
+        context.send_video_nal(
+            timestamp,
+            global_view_params,
+            foveation_center_shifts,
+            is_idr,
+            buffer.to_vec(),
+        );
     }
 }
 

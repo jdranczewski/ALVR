@@ -1,6 +1,7 @@
 use alvr_common::{
-    BodySkeleton, ConnectionState, DeviceMotion, LogSeverity, Pose, ViewParams,
-    anyhow::Result,
+    AlvrFoveatedEncodingParams, BodySkeleton, ConnectionState, DeviceMotion, LogSeverity, Pose,
+    ViewParams,
+    anyhow::{Error, Result},
     glam::{Quat, UVec2, Vec2},
     semver::Version,
 };
@@ -8,12 +9,14 @@ use alvr_session::{
     ClientsidePostProcessingConfig, CodecType, PassthroughMode, PerformanceLevel, SessionConfig,
     Settings,
 };
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json as json;
 use std::{
     collections::HashSet,
-    fmt::{self, Debug},
+    fmt::{self, Debug, Write as _},
     net::IpAddr,
+    sync::LazyLock,
     time::Duration,
 };
 
@@ -85,7 +88,7 @@ pub struct ClientNegotiatedStreamingConfig {
     pub view_resolution: UVec2,
     pub refresh_rate_hint: f32,
     pub game_audio_sample_rate: u32,
-    pub enable_foveated_encoding: bool,
+    pub foveated_encoding: Option<AlvrFoveatedEncodingParams>,
     pub encoding_gamma: f32,
     pub enable_hdr: bool,
     pub wired: bool,
@@ -218,9 +221,11 @@ pub enum FaceExpressions {
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct FaceData {
-    // Can be used for foveated eye tracking
+    /// Head-local orientation whose -Z axis follows the combined gaze direction.
+    /// The sample is associated with TrackingData::poll_timestamp, not an independent gaze clock.
     pub eyes_combined: Option<Quat>,
-    // Should be used only for social presence
+    /// Head-local per-eye orientations, potentially smoothed by the runtime for social presence.
+    /// Also used as a foveation input fallback when native combined gaze is unavailable.
     pub eyes_social: [Option<Quat>; 2],
 
     pub face_expressions: Option<FaceExpressions>,
@@ -239,6 +244,8 @@ pub struct TrackingData {
 pub struct VideoPacketHeader {
     pub timestamp: Duration,
     pub global_view_params: [ViewParams; 2],
+    /// Centers used to encode this frame, already aligned. Normally absent when FFR is disabled.
+    pub foveation_center_shifts: Option<[[f32; 2]; 2]>,
     pub is_idr: bool,
 }
 
@@ -256,12 +263,18 @@ pub enum PathSegment {
     Index(usize),
 }
 
-impl Debug for PathSegment {
+impl fmt::Display for PathSegment {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PathSegment::Name(name) => write!(f, "{name}"),
             PathSegment::Index(index) => write!(f, "[{index}]"),
         }
+    }
+}
+
+impl Debug for PathSegment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self}")
     }
 }
 
@@ -283,9 +296,65 @@ impl From<usize> for PathSegment {
     }
 }
 
-// todo: support indices
-pub fn parse_path(path: &str) -> Vec<PathSegment> {
-    path.split('.').map(|s| s.into()).collect()
+// A name segment + a (possibly empty) list of `[index]` segments.
+static COMPOUND_SEGMENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([A-Za-z0-9_]+)((?:\[[0-9]+\])*)").unwrap());
+
+/// Parses a settings path like `"video.foveated_encoding.enable"` or
+/// `"headset.controllers.content.gestures[2].joystick_range"` into name/index segments.
+pub fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
+    fn parse_error(path: &str, rest: &str, expected: &str) -> Error {
+        let found = rest
+            .chars()
+            .next()
+            .map_or_else(|| "end of input".to_owned(), |c| format!("`{c}`"));
+        Error::msg(format!(
+            "invalid path \"{path}\" at column {}: expected {expected}, found {found}",
+            path.len() - rest.len() + 1,
+        ))
+    }
+
+    let mut segments = Vec::new();
+    let mut rest = path;
+
+    loop {
+        let Some(caps) = COMPOUND_SEGMENT.captures(rest) else {
+            return Err(parse_error(path, rest, "a name `[A-Za-z0-9_]+`"));
+        };
+        segments.push(PathSegment::Name(caps[1].to_owned()));
+        for index in caps[2].split(['[', ']']).filter(|s| !s.is_empty()) {
+            match index.parse() {
+                Ok(index) => segments.push(PathSegment::Index(index)),
+                Err(_) => {
+                    let at = &rest[caps[1].len()..];
+                    return Err(parse_error(
+                        path,
+                        at,
+                        &format!("index `{index}` to fit in a usize"),
+                    ));
+                }
+            }
+        }
+        rest = &rest[caps[0].len()..];
+
+        if rest.is_empty() {
+            return Ok(segments);
+        }
+        rest = rest
+            .strip_prefix('.')
+            .ok_or_else(|| parse_error(path, rest, "`.` or end of input"))?;
+    }
+}
+
+pub fn path_to_string(path: &[PathSegment]) -> String {
+    let mut string = String::new();
+    for (i, segment) in path.iter().enumerate() {
+        if i != 0 && matches!(segment, PathSegment::Name(_)) {
+            string.push('.');
+        }
+        let _ = write!(string, "{segment}");
+    }
+    string
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -349,5 +418,108 @@ impl RealTimeConfig {
             gpu_performance_level: settings.headset.performance_level.clone().gpu.into_option(),
             ext_str: String::new(), // No extensions for now
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PathSegment, parse_path, path_to_string};
+
+    fn debug_path(path: &str) -> String {
+        format!("{:?}", parse_path(path).unwrap())
+    }
+
+    #[test]
+    fn parses_names_only() {
+        assert_eq!(debug_path("my.element.content"), "[my, element, content]");
+    }
+
+    #[test]
+    fn parses_index_between_names() {
+        let segments = parse_path("my.element[1].content").unwrap();
+        assert!(matches!(
+            segments.as_slice(),
+            [
+                PathSegment::Name(a),
+                PathSegment::Name(b),
+                PathSegment::Index(1),
+                PathSegment::Name(c),
+            ] if a == "my" && b == "element" && c == "content"
+        ));
+    }
+
+    #[test]
+    fn parses_chained_indices() {
+        assert_eq!(debug_path("matrix[1][2]"), "[matrix, [1], [2]]");
+        assert_eq!(debug_path("a[0][12][345]"), "[a, [0], [12], [345]]");
+    }
+
+    #[test]
+    fn accepts_underscores_and_digits_in_names() {
+        assert_eq!(debug_path("_priv.x1[0]._2y"), "[_priv, x1, [0], _2y]");
+    }
+
+    #[test]
+    fn rejects_malformed_paths() {
+        for path in [
+            "",
+            ".foo",
+            "foo.",
+            "foo..bar",
+            ".[1]",
+            "foo.[1]",
+            "[0].foo",
+            "foo[]",
+            "foo[",
+            "foo[1",
+            "foo[1]bar",
+            "foo[-1]",
+            "foo[1.5]",
+            "foo[key]",
+            "foo-bar",
+            "foo bar",
+            "foo.bar!",
+            "foé",
+        ] {
+            assert!(
+                parse_path(path).is_err(),
+                "expected \"{path}\" to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_index_overflow() {
+        assert!(parse_path("foo[99999999999999999999999999]").is_err());
+    }
+
+    #[test]
+    fn path_to_string_round_trips() {
+        for path in [
+            "a",
+            "a.b.c",
+            "a[0]",
+            "a[1][2].b",
+            "video.foveated_encoding.strength",
+            "headset.controllers.content.gestures[2].joystick_range",
+        ] {
+            assert_eq!(path_to_string(&parse_path(path).unwrap()), path);
+        }
+    }
+
+    #[test]
+    fn error_points_at_the_failing_column() {
+        assert_eq!(
+            parse_path("foo..bar").unwrap_err().to_string(),
+            "invalid path \"foo..bar\" at column 5: expected a name `[A-Za-z0-9_]+`, found `.`",
+        );
+        assert_eq!(
+            parse_path("foo[1]x").unwrap_err().to_string(),
+            "invalid path \"foo[1]x\" at column 7: expected `.` or end of input, found `x`",
+        );
+        assert_eq!(
+            parse_path("foo[]").unwrap_err().to_string(),
+            "invalid path \"foo[]\" at column 4: expected `.` or end of input, found `[`",
+        );
     }
 }

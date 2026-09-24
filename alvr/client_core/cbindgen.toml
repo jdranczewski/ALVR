@@ -12,4 +12,3 @@ rename_variants = "QualifiedScreamingSnakeCase"
 [parse]
 parse_deps = true
 include = ["alvr_common"]
-

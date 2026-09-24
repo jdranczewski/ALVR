@@ -88,6 +88,19 @@ struct FfiDynamicEncoderParams {
     float framerate;
 };
 
+struct FfiFoveatedEncodingParams {
+    unsigned int encodedViewResolution[2];
+    float viewRatio[2];
+    float centerSize[2];
+    float centerShifts[2][2];
+    float edgeRatio[2];
+};
+
+struct FfiFoveationCenters {
+    bool valid;
+    float centerShifts[2][2];
+};
+
 struct Settings {
     int m_refreshRate;
     unsigned int m_renderWidth;
@@ -98,12 +111,7 @@ struct Settings {
     char m_captureFrameDir[1024];
 
     bool m_enableFoveatedEncoding;
-    float m_foveationCenterSizeX;
-    float m_foveationCenterSizeY;
-    float m_foveationCenterShiftX;
-    float m_foveationCenterShiftY;
-    float m_foveationEdgeRatioX;
-    float m_foveationEdgeRatioY;
+    FfiFoveatedEncodingParams m_foveatedEncoding;
 
     bool m_enableColorCorrection;
     float m_brightness;
@@ -208,6 +216,10 @@ extern "C" unsigned long long PathStringToHash(const char* path);
 extern "C" void ReportPresent(unsigned long long timestamp_ns, unsigned long long offset_ns);
 extern "C" void ReportComposed(unsigned long long timestamp_ns, unsigned long long offset_ns);
 extern "C" FfiDynamicEncoderParams GetDynamicEncoderParams();
+extern "C" FfiFoveationCenters GetEyeTrackedFoveationCenters(unsigned long long targetTimestampNs);
+extern "C" void ReportEncoderFoveationCenters(
+    unsigned long long targetTimestampNs, float leftX, float leftY, float rightX, float rightY
+);
 extern "C" unsigned long long GetSerialNumber(unsigned long long deviceID, char* outString);
 extern "C" void SetOpenvrProps(void* instancePtr, unsigned long long deviceID);
 extern "C" void RegisterButtons(void* instancePtr, unsigned long long deviceID);
